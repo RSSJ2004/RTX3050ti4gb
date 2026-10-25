@@ -187,8 +187,8 @@ void TextureCache::RefreshGcLimits() {
         device_guard_memory = std::max<u64>(card > headroom ? card - headroom : 0,
                                             card / 2);
     }
-    // RTX 3050 Ti profile: keep the image cache below 2 GiB and start the global guard at
-    // 2.2 GiB. The latter includes buffers, staging and driver allocations; the former is the
+    // RTX 3050 Ti profile: keep the image cache below 2.2 GiB and start the global guard at
+    // 2.4 GiB. The latter includes buffers, staging and driver allocations; the former is the
     // hard texture-cache ceiling that the LRU collector must enforce.
     device_guard_memory = std::min(device_guard_memory, iss::vram_stats::PressureLimitBytes);
     u64 budget = forced_gc_budget

@@ -14,8 +14,8 @@
 
 namespace iss::vram_stats {
 
-constexpr std::uint64_t HardLimitBytes = 2000ull << 20;
-constexpr std::uint64_t PressureLimitBytes = 2200ull << 20;
+constexpr std::uint64_t HardLimitBytes = 2200ull << 20;
+constexpr std::uint64_t PressureLimitBytes = 2400ull << 20;
 
 /// Buffer memory types (VideoCore::MemoryType order), then images.
 enum Kind : int { DeviceLocal, HostUncached, HostCached, Stream, Sparse, Images, KindCount };

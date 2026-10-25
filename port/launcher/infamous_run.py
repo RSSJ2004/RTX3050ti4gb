@@ -308,7 +308,7 @@ def resolve_game_language(settings, environ=None):
 # TLG core defaults (the reasons are in each comment; still to be validated on this game).
 DEFAULT_ENV = {
     'ISS_PIPELINE_BINARIES': '0',  # VK_KHR_pipeline_binary crashes on the NVIDIA 595 driver
-    'ISS_GC_BUDGET_MB': '2000',    # RTX 3050 Ti profile; v2 clamps the image cache to 2 GiB
+    'ISS_GC_BUDGET_MB': '2200',    # RTX 3050 Ti profile; v2 clamps the image cache to 2.2 GiB
     'ISS_UPSCALER': 'off',         # native image: GoW3's temporal upscalers made it shake
     'ISS_JITTER': '0',
     'ISS_OBJECT_MOTION': '0',
@@ -326,7 +326,7 @@ DEFAULT_SETTINGS = {
     'show_fps': False,
     'display_mode': 'Windowed',    # Windowed | Borderless | Fullscreen (tlg.ini)
     'vsync': True,
-    'vram_budget_mb': 2000,  # conservative renderer-v2 image budget for 4 GB cards
+    'vram_budget_mb': 2200,  # conservative renderer-v2 image budget for 4 GB cards
     'vram_auto': False,      # keep the 2 GiB cap instead of following the driver's live budget
     'stick_deadzone': 10,    # percent; runtime_pad.c ISS_STICK_DEADZONE
     'eager_readback': False,  # ISS_EAGER_READBACK: copy GPU results the game reads back at each fence
@@ -780,7 +780,7 @@ def build_env(settings, extra=None):
         env.setdefault(key, value)  # explicit ISS_* in the environment always win
     # Renderer v2 computes the texture budget itself (what the card leaves after everything else);
     # this port's renderer always takes the number.
-    configured_budget = min(int(settings['vram_budget_mb']), 2000) if renderer_v2(settings) else int(settings['vram_budget_mb'])
+    configured_budget = min(int(settings['vram_budget_mb']), 2200) if renderer_v2(settings) else int(settings['vram_budget_mb'])
     budget = 'auto' if settings.get('vram_auto', True) and renderer_v2(settings) else str(configured_budget)
     env['ISS_GC_BUDGET_MB'] = os.environ.get('ISS_GC_BUDGET_MB', budget)
     env['ISS_READBACKS'] = os.environ.get('ISS_READBACKS', str(settings.get('gpu_readbacks', '2')))
