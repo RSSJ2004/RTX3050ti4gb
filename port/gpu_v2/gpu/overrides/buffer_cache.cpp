@@ -137,8 +137,20 @@ bool UniqueReadbackBacking(Core::MemoryManager& memory, VAddr address, u64 size,
 // even when the guest faults on the same feedback page every frame.
 constexpr u64 ReadbackDiagMaxBytes = 32_MB;
 constexpr u64 ReadbackDiagMaxRows = 200'000;
+std::atomic<u64> g_readback_diag_sequence{};
+thread_local u64 g_readback_diag_id{};
+struct ReadbackDiagScope {
+    u64 previous{};
+    explicit ReadbackDiagScope(u64 id) : previous{g_readback_diag_id} {
+        g_readback_diag_id = id;
+    }
+    ~ReadbackDiagScope() {
+        g_readback_diag_id = previous;
+    }
+};
 struct ReadbackDiagEvent {
     const char* event{};
+    u64 readback_id{};
     u64 rip{};
     u64 address{};
     u64 size{};
@@ -196,7 +208,7 @@ void LogReadbackDiag(const ReadbackDiagEvent& e) {
         std::FILE* out = std::fopen(std::getenv("ISS_READBACK_DIAG_LOG"), "wb");
         if (out) {
             std::setvbuf(out, nullptr, _IOFBF, 1 << 20);
-            std::fputs("event,ns,frame,thread,rip,address,size,src,dst,window_start,window_end,"
+            std::fputs("event,readback_id,ns,frame,thread,rip,address,size,src,dst,window_start,window_end,"
                        "request_gfx_tick,request_compute_tick,window_gfx_tick,window_compute_tick,"
                        "request_state,window_state,queue,wait_tick,copies,copy_bytes,duration_ns,flags\n", out);
         }
@@ -214,9 +226,10 @@ void LogReadbackDiag(const ReadbackDiagEvent& e) {
     char line[512];
     const int result = std::snprintf(
         line, sizeof(line),
-        "%s,%llu,%llu,%llu,0x%llx,0x%llx,%llu,0x%llx,0x%llx,0x%llx,0x%llx,"
+        "%s,%llu,%llu,%llu,%llu,0x%llx,0x%llx,%llu,0x%llx,0x%llx,0x%llx,0x%llx,"
         "%llu,%llu,%llu,%llu,%u,%u,%u,%llu,%u,%llu,%llu,%u\n",
-        e.event, static_cast<unsigned long long>(now), static_cast<unsigned long long>(frame),
+        e.event, static_cast<unsigned long long>(e.readback_id ? e.readback_id : g_readback_diag_id),
+        static_cast<unsigned long long>(now), static_cast<unsigned long long>(frame),
         static_cast<unsigned long long>(thread), static_cast<unsigned long long>(e.rip),
         static_cast<unsigned long long>(e.address), static_cast<unsigned long long>(e.size),
         static_cast<unsigned long long>(e.src), static_cast<unsigned long long>(e.dst),
@@ -235,7 +248,10 @@ void LogReadbackDiag(const ReadbackDiagEvent& e) {
     std::scoped_lock lock{mutex};
     if (rows >= ReadbackDiagMaxRows || bytes + result > ReadbackDiagMaxBytes) {
         if (!truncated) {
-            std::fputs("truncated\n", file);
+            std::fprintf(stderr, "READBACK_DIAG_TRUNCATED rows=%llu bytes=%llu\n",
+                         static_cast<unsigned long long>(rows),
+                         static_cast<unsigned long long>(bytes));
+            std::fflush(stderr);
             std::fflush(file);
             truncated = true;
         }
@@ -1496,6 +1512,10 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         ASSERT_MSG(liverpool->AscOwnerPausedForGraphics(),
                    "G4 readback entered without an acknowledged C owner pause");
     const u64 request_ns = Common::Perf::NowNs();
+    const u64 readback_id = ReadbackDiagEnabled()
+                                ? g_readback_diag_sequence.fetch_add(1, std::memory_order_relaxed) + 1
+                                : 0;
+    ReadbackDiagScope request_diag_scope{readback_id};
     static std::atomic<u64> trace_sequence{};
     const auto trace_id=iss::timeline::enabled?trace_sequence.fetch_add(1,std::memory_order_relaxed)+1:0;
     if(trace_id)iss::timeline::Emit("readback_begin",reinterpret_cast<u64>(this),trace_id,
@@ -1558,7 +1578,8 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     if (!assume_locks && !is_write && IsRelaxedSite(guest_rip)) {
         // readback_relaxed_sites: this code reads GPU results without waiting for the GPU (the
         // previous ones, the new ones land in guest memory once the GPU is done).
-        liverpool->SendCommand<true>([&] {
+        liverpool->SendCommand<true>([&, readback_id] {
+            ReadbackDiagScope diag_scope{readback_id};
             Common::Perf::Add(Common::Perf::ReadbackQueueNs, Common::Perf::NowNs() - request_ns);
             LogReadbackDiag({.event = "guest_enqueue_done", .rip = guest_rip,
                              .address = device_addr, .size = size,
@@ -1575,7 +1596,8 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         // waited for the GPU to become idle, hundreds of times per second in busy scenes.
         u64 wait_tick = 0;
         Vulkan::Semaphore* wait_semaphore = nullptr;
-        liverpool->SendCommand<true>([&] {
+        liverpool->SendCommand<true>([&, readback_id] {
+            ReadbackDiagScope diag_scope{readback_id};
             Common::Perf::Add(Common::Perf::ReadbackQueueNs, Common::Perf::NowNs() - request_ns);
             LogReadbackDiag({.event = "guest_enqueue_done", .rip = guest_rip,
                              .address = device_addr, .size = size,
@@ -1594,7 +1616,8 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
             Vulkan::Semaphore* next_semaphore = nullptr;
             u64 next_tick = 0;
             const bool may_wait = round < 4;
-            liverpool->SendCommand<true>([&] {
+            liverpool->SendCommand<true>([&, readback_id] {
+                ReadbackDiagScope diag_scope{readback_id};
                 CompleteReadbacks(false);
                 if (!memory_tracker->IsRegionGpuModified(device_addr, size)) {
                     if (is_write) {
@@ -1622,7 +1645,9 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         }
         return;
     }
-    const auto flush_request = [this, device_addr, size, is_write, request_ns, guest_rip] {
+    const auto flush_request = [this, device_addr, size, is_write, request_ns, guest_rip,
+                                readback_id] {
+        ReadbackDiagScope diag_scope{readback_id};
         // Time spent waiting for the command processor thread to pick up the request.
         Common::Perf::Add(Common::Perf::ReadbackQueueNs, Common::Perf::NowNs() - request_ns);
         LogReadbackDiag({.event = "guest_enqueue_done", .rip = guest_rip,
@@ -1874,6 +1899,7 @@ u64 BufferCache::BeginReadback(VAddr device_addr, u64 size, bool is_write,
     }
 
     PendingReadback readback{
+        .readback_id = g_readback_diag_id,
         .arena_base = arena->cpu_addr,
         .window_start = window_start,
         .window_end = window_end,
@@ -2554,7 +2580,8 @@ void BufferCache::FinishReadback(size_t index) {
         for (const auto& copy : readback.copies) {
             copy_bytes += copy.size;
         }
-        LogReadbackDiag({.event = "readback_finish", .address = readback.window_start,
+        LogReadbackDiag({.event = "readback_finish", .readback_id = readback.readback_id,
+                         .address = readback.window_start,
                          .size = readback.window_end - readback.window_start,
                          .window_start = readback.window_start,
                          .window_end = readback.window_end,
@@ -4207,4 +4234,3 @@ void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info, bool graphic
 }
 
 } // namespace VideoCore
-

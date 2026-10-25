@@ -25,8 +25,9 @@ void Stop();
 void ApplyGameProfile(std::string_view serial);
 
 /**
- * Applies perf_tuning.ini from the user folder when it changes (checked at most once per second),
- * so strategies can be compared while the game runs. Lines are "key = value":
+ * Applies perf_tuning.ini from the user folder when it changes (checked at most once per second)
+ * when ISS_TUNING_WATCH=1 is enabled, so strategies can be compared while the game runs. Lines
+ * are "key = value":
  *   readback_window_kb = 512      window downloaded around a precise readback (power of two)
  *   readback_write_discard = 0    see GPUSettings::readbacks_write_discard
  *   readback_write_merge = 0      with write discard, the bytes the GPU wrote in a page whose
@@ -166,6 +167,9 @@ void ApplyGameProfile(std::string_view serial);
  *                                 (as on the PS4), except the dispatches using images
  */
 void PollTuning();
+
+/// Starts the opt-in perf_tuning.ini watcher after the GPU user directory is known.
+void StartTuningWatcher();
 
 /// Records a guest read of GPU written memory that needed a precise readback (address and guest
 /// instruction), reported with the profiles to find which data the game reads back.

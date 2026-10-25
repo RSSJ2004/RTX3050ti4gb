@@ -708,7 +708,10 @@ inline void CaptureFrameCsv(float draws_per_frame, float dispatches_per_frame) {
                     for (const auto& field : FrameCsvDetails) {
                         std::fprintf(file, ",%s", field.name);
                     }
-                    std::fputs(",gpu_profile_enabled\n", file);
+                    std::fputs(",gpu_profile_enabled,tuning_hot_page_faults,tuning_parallel_protect,"
+                               "tuning_late_protect,tuning_gpu_threads_priority,"
+                               "tuning_readback_window_bytes,tuning_gpu_profile\n",
+                               file);
                 }
             }
         }
@@ -766,8 +769,16 @@ inline void CaptureFrameCsv(float draws_per_frame, float dispatches_per_frame) {
         capture.detail_previous[i] = total;
     }
     if (capture.last != 0) {
-        std::fprintf(capture.file, ",%u\n",
-                     GetTuning().gpu_profile.load(std::memory_order_relaxed) != 0 ? 1u : 0u);
+        const auto& tuning = GetTuning();
+        std::fprintf(capture.file, ",%u,%u,%u,%u,%u,%llu,%u\n",
+                     tuning.gpu_profile.load(std::memory_order_relaxed) != 0 ? 1u : 0u,
+                     tuning.hot_page_faults.load(std::memory_order_relaxed),
+                     tuning.parallel_protect.load(std::memory_order_relaxed) ? 1u : 0u,
+                     tuning.late_protect.load(std::memory_order_relaxed) ? 1u : 0u,
+                     tuning.gpu_threads_priority.load(std::memory_order_relaxed),
+                     static_cast<unsigned long long>(
+                         tuning.readback_window_bytes.load(std::memory_order_relaxed)),
+                     tuning.gpu_profile.load(std::memory_order_relaxed));
     }
     // Bounded live visibility without flushing for each frame.
     if (now - capture.last_flush >= 1'000'000'000ULL) {

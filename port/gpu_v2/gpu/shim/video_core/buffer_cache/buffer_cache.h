@@ -482,6 +482,7 @@ private:
     /// A download from the GPU that was recorded and submitted without waiting for it. The guest
     /// thread that requested it waits for the GPU, then the data is written to guest memory.
     struct PendingReadback {
+        u64 readback_id{}; ///< Diagnostic request identity; zero when tracing is disabled.
         u64 tick{};
         u64 record_seq{}; ///< GPU writes numbered above it came after the download was recorded.
         Vulkan::StagingBufferRef download{};

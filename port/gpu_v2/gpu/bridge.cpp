@@ -30,6 +30,7 @@ namespace iss { extern std::atomic<unsigned> g_preload_entries, g_preload_total;
 #include <condition_variable>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include "g4_conditional_backing_write.h"
 #include <functional>
 #include <limits>
@@ -277,6 +278,87 @@ s32 PS4_SYSV_ABI sceKernelUsleep(u32 us){std::this_thread::sleep_for(std::chrono
 }
 namespace Libraries::SystemService {bool IsSplashVisible(){return false;}}
 namespace Core::PerfSampler {
+namespace {
+std::jthread tuning_watcher;
+
+std::string TrimTuning(std::string value) {
+    const auto first = value.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) return {};
+    const auto last = value.find_last_not_of(" \t\r\n");
+    return value.substr(first, last - first + 1);
+}
+
+void LogTuningEffective(const Common::Perf::Tuning& tuning, const char* source) {
+    std::fprintf(stderr,
+                 "TUNING_EFFECTIVE source=%s hot_page_faults=%u parallel_protect=%u "
+                 "late_protect=%u gpu_threads_priority=%u readback_window_bytes=%llu "
+                 "gpu_profile=%u\n",
+                 source,
+                 tuning.hot_page_faults.load(std::memory_order_relaxed),
+                 tuning.parallel_protect.load(std::memory_order_relaxed) ? 1U : 0U,
+                 tuning.late_protect.load(std::memory_order_relaxed) ? 1U : 0U,
+                 tuning.gpu_threads_priority.load(std::memory_order_relaxed),
+                 static_cast<unsigned long long>(
+                     tuning.readback_window_bytes.load(std::memory_order_relaxed)),
+                 tuning.gpu_profile.load(std::memory_order_relaxed));
+}
+
+void ApplyTuningFile(const std::filesystem::path& path, Common::Perf::Tuning& tuning) {
+    std::ifstream input(path);
+    if (!input) return;
+    std::string line;
+    while (std::getline(input, line)) {
+        if (const auto comment = line.find('#'); comment != std::string::npos)
+            line.resize(comment);
+        const auto equal = line.find('=');
+        if (equal == std::string::npos) continue;
+        const std::string name = TrimTuning(line.substr(0, equal));
+        const std::string value = TrimTuning(line.substr(equal + 1));
+        if (name.empty() || value.empty()) continue;
+        const auto number = std::strtoull(value.c_str(), nullptr, 0);
+        if (name == "hot_page_faults") {
+            tuning.hot_page_faults.store(static_cast<u32>(number), std::memory_order_relaxed);
+        } else if (name == "parallel_protect") {
+            tuning.parallel_protect.store(number != 0, std::memory_order_relaxed);
+        } else if (name == "late_protect") {
+            tuning.late_protect.store(number != 0, std::memory_order_relaxed);
+        } else if (name == "gpu_threads_priority") {
+            tuning.gpu_threads_priority.store(static_cast<u32>(number), std::memory_order_relaxed);
+        } else if (name == "gpu_profile") {
+            tuning.gpu_profile.store(static_cast<u32>(number), std::memory_order_relaxed);
+        } else if (name == "readback_window_kb") {
+            tuning.readback_window_bytes.store(number * 1024, std::memory_order_relaxed);
+        } else if (name == "readback_window_bytes") {
+            tuning.readback_window_bytes.store(number, std::memory_order_relaxed);
+        }
+    }
+    std::fprintf(stderr, "TUNING_RELOAD path=%s\n", path.string().c_str());
+    LogTuningEffective(tuning, "perf_tuning.ini");
+}
+} // namespace
+
+void StartTuningWatcher() {
+    const char* enabled = std::getenv("ISS_TUNING_WATCH");
+    if (!enabled || enabled[0] != '1' || tuning_watcher.joinable()) return;
+    const auto path = std::filesystem::path(host.user_dir) / "perf_tuning.ini";
+    tuning_watcher = std::jthread([path](std::stop_token stop) {
+        std::filesystem::file_time_type previous{};
+        bool seen = false;
+        auto& tuning = Common::Perf::GetTuning();
+        while (!stop.stop_requested()) {
+            std::error_code error;
+            const auto stamp = std::filesystem::last_write_time(path, error);
+            if (!error && (!seen || stamp != previous)) {
+                previous = stamp;
+                seen = true;
+                ApplyTuningFile(path, tuning);
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+    });
+    std::fprintf(stderr, "TUNING_WATCH enabled path=%s\n", path.string().c_str());
+}
+
 void PollTuning(){iss::diagnostics::Poll();}
 void RecordReadback(unsigned long long address,unsigned long long rip){
     static const bool trace=[] {const char *p=std::getenv("ISS_TRACE_READBACK");return p&&p[0]=='1';}();if(!trace)return;
@@ -519,6 +601,7 @@ extern "C" int iss_gpu_initialize(const IssGpuCallbacks *callbacks){
             std::fprintf(stderr,"PORT_TUNING %s=%s%s\n",name.c_str(),value.c_str(),known?"":" (unknown, ignored)");
         }
     }
+    Core::PerfSampler::StartTuningWatcher();
     window_thread=std::thread([]{
         try{
             g_window=new Frontend::WindowSDL(host.width,host.height,host.title);
