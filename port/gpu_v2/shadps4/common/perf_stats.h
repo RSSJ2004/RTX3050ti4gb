@@ -762,7 +762,11 @@ inline void CaptureFrameCsv(float draws_per_frame, float dispatches_per_frame) {
 
 inline void OnFlip(float draws_per_frame, float dispatches_per_frame) {
     CaptureFrameCsv(draws_per_frame, dispatches_per_frame);
-    if (!GetTuning().perf_log.load(std::memory_order_relaxed)) {
+    static const bool pipeline_diag = [] {
+        const char* value = std::getenv("ISS_PIPELINE_DIAG");
+        return value && value[0] == '1';
+    }();
+    if (!GetTuning().perf_log.load(std::memory_order_relaxed) && !pipeline_diag) {
         return;
     }
     struct Reporter {
@@ -830,6 +834,18 @@ inline void OnFlip(float draws_per_frame, float dispatches_per_frame) {
                     mb(frame[BufferUploadBytes]), ms(frame[BufferUploadNs]), frame[ImageRefreshes],
                     mb(frame[ImageUploadBytes]), ms(frame[ImageRefreshNs]), frame[ImageCreates],
                     ms(frame[GpuBusyNs]), ms(frame[GpuSpinNs]));
+        if (pipeline_diag) {
+            std::fprintf(stderr,
+                         "PERF_SLOW_FRAME index=%llu frame_ms=%.3f pipeline_stall_ms=%.3f "
+                         "pipeline_skips=%llu gpu_wait_ms=%.3f buffer_upload_ms=%.3f "
+                         "image_refresh_ms=%.3f\n",
+                         static_cast<unsigned long long>(r.flip_index), frame_ms,
+                         ms(frame[PipelineStallNs]),
+                         static_cast<unsigned long long>(frame[PipelineSkips]),
+                         ms(frame[GpuWaitNs]), ms(frame[BufferUploadNs]),
+                         ms(frame[ImageRefreshNs]));
+            std::fflush(stderr);
+        }
     }
 
     const u64 window_ns = now - r.window_start;
@@ -842,6 +858,20 @@ inline void OnFlip(float draws_per_frame, float dispatches_per_frame) {
     const auto pct = [window_ns](u64 ns) {
         return 100.0 * static_cast<double>(ns) / static_cast<double>(window_ns);
     };
+    if (pipeline_diag) {
+        std::fprintf(stderr,
+                     "PERF_FRAME fps=%.3f avg_ms=%.3f max_ms=%.3f over33=%u over50=%u "
+                     "shader_compile_ms=%.3f pipeline_compile_ms=%.3f pipeline_stall_ms=%.3f "
+                     "pipeline_skips=%llu gpu_wait_ms=%.3f buffer_upload_ms=%.3f "
+                     "image_refresh_ms=%.3f\n",
+                     static_cast<double>(r.frames) / seconds,
+                     r.frames ? r.frame_ms_sum / static_cast<double>(r.frames) : 0.0,
+                     r.frame_ms_max, r.frames_over_33, r.frames_over_50,
+                     ms(t[ShaderCompileNs]), ms(t[PipelineCreateNs]), ms(t[PipelineStallNs]),
+                     static_cast<unsigned long long>(t[PipelineSkips]), ms(t[GpuWaitNs]),
+                     ms(t[BufferUploadNs]), ms(t[ImageRefreshNs]));
+        std::fflush(stderr);
+    }
     LOG_INFO(Debug,
              "Perf: {:.1f} fps | frame avg {:.1f} ms max {:.1f} ms | >33ms {} >50ms {} | gpu "
              "thread work {:.0f}% spin {:.0f}% (cpu {}) | shaders {} ({:.0f} ms) pipelines {} "

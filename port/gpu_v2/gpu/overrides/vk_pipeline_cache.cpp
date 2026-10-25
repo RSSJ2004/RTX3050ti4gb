@@ -2398,6 +2398,9 @@ void PipelineCache::CompileAsync(Pipeline* pipeline) {
             LOG_WARNING(Render_Vulkan,
                         "PIPE_DIAG async_wait wait_us={} elapsed_us={} ready={}", wait_us,
                         elapsed_us, ready);
+            std::fprintf(stderr, "PIPE_DIAG async_wait wait_us=%u elapsed_us=%lld ready=%d\n",
+                         wait_us, static_cast<long long>(elapsed_us), ready ? 1 : 0);
+            std::fflush(stderr);
         }
     }
 }
@@ -2412,6 +2415,9 @@ bool PipelineCache::CompileNowIfQueued(const Pipeline* pipeline) {
                                     std::chrono::steady_clock::now() - started)
                                     .count();
         LOG_WARNING(Render_Vulkan, "PIPE_DIAG lazy_steal elapsed_us={}", elapsed_us);
+        std::fprintf(stderr, "PIPE_DIAG lazy_steal elapsed_us=%lld\n",
+                     static_cast<long long>(elapsed_us));
+        std::fflush(stderr);
     }
     return compiled;
 }
@@ -2718,6 +2724,12 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
                         pipeline_hash,
                         bool(params.vertex_sgpr_offset || params.instance_sgpr_offset),
                         compiler && compiler->HasCapacity());
+            std::fprintf(stderr,
+                         "PIPE_DIAG sync_compile pipeline=0x%llx is_indirect=%d compiler_capacity=%d\n",
+                         static_cast<unsigned long long>(pipeline_hash),
+                         bool(params.vertex_sgpr_offset || params.instance_sgpr_offset) ? 1 : 0,
+                         compiler && compiler->HasCapacity() ? 1 : 0);
+            std::fflush(stderr);
         }
         GraphicsPipeline::SerializationSupport sdata{};
         it.value() = std::make_unique<GraphicsPipeline>(
@@ -2754,6 +2766,10 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
                                         .count();
             LOG_WARNING(Render_Vulkan, "PIPE_DIAG sync_compile_done pipeline={:#x} elapsed_us={}",
                         pipeline_hash, elapsed_us);
+            std::fprintf(stderr, "PIPE_DIAG sync_compile_done pipeline=0x%llx elapsed_us=%lld\n",
+                         static_cast<unsigned long long>(pipeline_hash),
+                         static_cast<long long>(elapsed_us));
+            std::fflush(stderr);
         }
         return remember(pipeline);
     }
