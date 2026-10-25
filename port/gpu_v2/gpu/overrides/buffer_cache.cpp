@@ -1513,6 +1513,10 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         ASSERT_MSG(liverpool->AscOwnerPausedForGraphics(),
                    "G4 readback entered without an acknowledged C owner pause");
     const u64 request_ns = Common::Perf::NowNs();
+    const bool region_diag = Common::Perf::RegionDiagEnabled();
+    const u64 region_queue_before = region_diag ? Common::Perf::Total(Common::Perf::ReadbackQueueNs) : 0;
+    const u64 region_sync_before = region_diag ? Common::Perf::Total(Common::Perf::ReadbackSyncNs) : 0;
+    const u64 region_wait_before = region_diag ? Common::Perf::Total(Common::Perf::ReadbackAsyncWaitNs) : 0;
     const u64 readback_id = ReadbackDiagEnabled()
                                 ? g_readback_diag_sequence.fetch_add(1, std::memory_order_relaxed) + 1
                                 : 0;
@@ -1527,6 +1531,13 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
                                                   (assume_locks ? 2U : 0U)});
     }
     SCOPE_EXIT {
+        if (region_diag) {
+            Common::Perf::RecordReadbackRegionTiming(
+                device_addr, is_write, Common::Perf::NowNs() - request_ns,
+                Common::Perf::Total(Common::Perf::ReadbackQueueNs) - region_queue_before,
+                Common::Perf::Total(Common::Perf::ReadbackSyncNs) - region_sync_before,
+                Common::Perf::Total(Common::Perf::ReadbackAsyncWaitNs) - region_wait_before);
+        }
         if(trace_id)iss::timeline::Emit("readback_end",reinterpret_cast<u64>(this),trace_id,
             device_addr,size,guest_rip,0,Common::Perf::NowNs()-request_ns);
         if (ReadbackDiagEnabled()) {

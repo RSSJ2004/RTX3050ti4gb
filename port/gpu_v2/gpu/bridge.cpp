@@ -341,6 +341,7 @@ struct AbSchedule {
     u64 first{};
     u64 second{};
     u64 block_seconds{};
+    std::string pattern{"AB"};
 };
 
 bool ParseAbSchedule(const char* text, AbSchedule& out) {
@@ -354,20 +355,25 @@ bool ParseAbSchedule(const char* text, AbSchedule& out) {
         if (end == std::string::npos) break;
         start = end + 1;
     }
-    if (parts.size() != 4 || parts[0].empty() || parts[3].empty()) return false;
+    if ((parts.size() != 4 && parts.size() != 5) || parts[0].empty() || parts[3].empty()) return false;
     out.name = parts[0];
     out.first = std::strtoull(parts[1].c_str(), nullptr, 0);
     out.second = std::strtoull(parts[2].c_str(), nullptr, 0);
     out.block_seconds = std::strtoull(parts[3].c_str(), nullptr, 0);
+    if (parts.size() == 5 && !parts[4].empty()) out.pattern = parts[4];
+    for (const char state : out.pattern)
+        if (state != 'A' && state != 'B') return false;
+    if (out.name == "readback_write_merge" && (out.first > 1 || out.second > 1)) return false;
     return out.block_seconds != 0 &&
            (out.name == "hot_page_faults" || out.name == "parallel_protect" ||
             out.name == "late_protect" || out.name == "gpu_threads_priority" ||
             out.name == "gpu_profile" || out.name == "readback_window_bytes" ||
-            out.name == "readback_window_kb");
+            out.name == "readback_window_kb" || out.name == "readback_write_merge");
 }
 
 void ApplyAbSchedule(const AbSchedule& schedule, Common::Perf::Tuning& tuning, u64 block) {
-    const u64 value = (block & 1) ? schedule.second : schedule.first;
+    const bool state_b = schedule.pattern[block % schedule.pattern.size()] == 'B';
+    const u64 value = state_b ? schedule.second : schedule.first;
     if (schedule.name == "hot_page_faults") {
         tuning.hot_page_faults.store(static_cast<u32>(value), std::memory_order_relaxed);
     } else if (schedule.name == "parallel_protect") {
@@ -378,13 +384,15 @@ void ApplyAbSchedule(const AbSchedule& schedule, Common::Perf::Tuning& tuning, u
         tuning.gpu_threads_priority.store(static_cast<u32>(value), std::memory_order_relaxed);
     } else if (schedule.name == "gpu_profile") {
         tuning.gpu_profile.store(static_cast<u32>(value), std::memory_order_relaxed);
+    } else if (schedule.name == "readback_write_merge") {
+        tuning.readback_write_merge.store(value != 0, std::memory_order_relaxed);
     } else if (schedule.name == "readback_window_kb") {
         tuning.readback_window_bytes.store(value * 1024, std::memory_order_relaxed);
     } else if (schedule.name == "readback_window_bytes") {
         tuning.readback_window_bytes.store(value, std::memory_order_relaxed);
     }
     tuning.ab_block.store(block, std::memory_order_relaxed);
-    tuning.ab_state.store(static_cast<u32>(block & 1), std::memory_order_relaxed);
+    tuning.ab_state.store(state_b ? 1u : 0u, std::memory_order_relaxed);
 }
 } // namespace
 
@@ -400,7 +408,8 @@ void StartTuningWatcher() {
         std::filesystem::file_time_type previous{};
         bool seen = false;
         u64 applied_block = ~u64{};
-        const auto started = std::chrono::steady_clock::now();
+        bool combat_started = false;
+        std::chrono::steady_clock::time_point started{};
         auto& tuning = Common::Perf::GetTuning();
         while (!stop.stop_requested()) {
             if (watch) {
@@ -413,12 +422,25 @@ void StartTuningWatcher() {
                 }
             }
             if (schedule_enabled) {
-                const u64 elapsed = static_cast<u64>(std::chrono::duration_cast<std::chrono::seconds>(
-                    std::chrono::steady_clock::now() - started).count());
-                const u64 block = elapsed / schedule.block_seconds;
-                if (block != applied_block) {
-                    ApplyAbSchedule(schedule, tuning, block);
-                    applied_block = block;
+                const auto now = std::chrono::steady_clock::now();
+                if (!combat_started &&
+                    Common::Perf::CsvPhaseCode().load(std::memory_order_relaxed) == 1) {
+                    combat_started = true;
+                    started = now;
+                    applied_block = ~u64{};
+                }
+                if (combat_started) {
+                    const u64 elapsed = static_cast<u64>(std::chrono::duration_cast<std::chrono::seconds>(
+                        now - started).count());
+                    const u64 block = elapsed / schedule.block_seconds;
+                    if (block != applied_block) {
+                        ApplyAbSchedule(schedule, tuning, block);
+                        applied_block = block;
+                    }
+                } else {
+                    // UINT64_MAX is serialized as the explicit "pre" marker by the CSV.
+                    tuning.ab_block.store(~u64{}, std::memory_order_relaxed);
+                    tuning.ab_state.store(0, std::memory_order_relaxed);
                 }
             }
             std::this_thread::sleep_for(std::chrono::seconds(1));

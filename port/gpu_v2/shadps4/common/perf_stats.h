@@ -332,6 +332,13 @@ constexpr size_t ReadbackRegionSlots = 64;
 struct ReadbackRegionCounter {
     std::atomic<u64> key{};
     std::atomic<u64> reads{};
+    std::atomic<u64> calls_read{};
+    std::atomic<u64> calls_write{};
+    std::atomic<u64> stall_read_ns{};
+    std::atomic<u64> stall_write_ns{};
+    std::atomic<u64> queue_ns{};
+    std::atomic<u64> sync_ns{};
+    std::atomic<u64> async_wait_ns{};
 };
 
 inline std::array<ReadbackRegionCounter, ReadbackRegionSlots>& ReadbackRegions() {
@@ -357,6 +364,49 @@ inline void RecordReadbackRegion(u64 address) noexcept {
             return;
         }
     }
+}
+
+inline bool RegionDiagEnabled() noexcept {
+    static const bool enabled = [] {
+        const char* value = std::getenv("ISS_REGION_DIAG");
+        return value && value[0] == '1';
+    }();
+    return enabled;
+}
+
+inline size_t ReadbackRegionSlot(u64 address) noexcept {
+    const u64 key = (address >> 20) + 1;
+    const size_t slot = static_cast<size_t>((key * 0x9E3779B97F4A7C15ULL) >> 58);
+    auto& regions = ReadbackRegions();
+    for (size_t probe = 0; probe < ReadbackRegionSlots; ++probe) {
+        auto& region = regions[(slot + probe) & (ReadbackRegionSlots - 1)];
+        u64 current = region.key.load(std::memory_order_acquire);
+        if (current == key) return (slot + probe) & (ReadbackRegionSlots - 1);
+        if (current == 0 && region.key.compare_exchange_strong(
+                current, key, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            return (slot + probe) & (ReadbackRegionSlots - 1);
+        }
+    }
+    return ReadbackRegionSlots;
+}
+
+inline void RecordReadbackRegionTiming(u64 address, bool is_write, u64 stall_ns,
+                                       u64 queue_ns, u64 sync_ns, u64 async_wait_ns) noexcept {
+    if (!RegionDiagEnabled()) return;
+    const size_t slot = ReadbackRegionSlot(address);
+    if (slot == ReadbackRegionSlots) return;
+    auto& region = ReadbackRegions()[slot];
+    (is_write ? region.calls_write : region.calls_read).fetch_add(1, std::memory_order_relaxed);
+    (is_write ? region.stall_write_ns : region.stall_read_ns).fetch_add(
+        stall_ns, std::memory_order_relaxed);
+    region.queue_ns.fetch_add(queue_ns, std::memory_order_relaxed);
+    region.sync_ns.fetch_add(sync_ns, std::memory_order_relaxed);
+    region.async_wait_ns.fetch_add(async_wait_ns, std::memory_order_relaxed);
+}
+
+inline std::atomic<u32>& CsvPhaseCode() {
+    static std::atomic<u32> phase{}; // 0=pre/wait, 1=combat, 2=end
+    return phase;
 }
 
 inline CounterRegistry& Registry() {
@@ -780,9 +830,11 @@ inline void CaptureFrameCsv(float draws_per_frame, float dispatches_per_frame) {
         std::array<u64, std::size(FrameCsvDetails)> detail_previous{};
         std::array<u64, 5> previous_cp{};
         std::array<u64, ReadbackRegionSlots> previous_regions{};
+        std::array<std::array<u64, 7>, ReadbackRegionSlots> previous_region_diag{};
         u64 last_flush{};
         u64 last_phase_poll{};
         char phase[16]{"wait"};
+        char ab_stage[8]{"pre"};
         const char* phase_path{};
         Capture() {
             phase_path = std::getenv("ISS_PHASE_FILE");
@@ -793,12 +845,16 @@ inline void CaptureFrameCsv(float draws_per_frame, float dispatches_per_frame) {
                     std::fputs("frame,present_ms,vram_mb,draws,dispatches,shader_compile_ms,pipeline_stall_"
                                "ms,gpu_wait_ms,readback_stall_ms,new_images,pipeline_skips,buffer_upload_ms,image_refresh_ms,page_protect_ms,pipeline_compile_ms,shader_compiles,pipelines_created,buffer_upload_bytes,image_upload_bytes,fault_reads,fault_writes,command_processor_ms,command_spin_ms,cp_other_ms,readback_region_reads",
                                file);
+                    for (unsigned i = 0; i < 8; ++i) {
+                        std::fprintf(file, ",rb%u_addr,rb%u_calls_read,rb%u_calls_write,rb%u_stall_ms,rb%u_queue_ms,rb%u_sync_ms,rb%u_async_wait_ms",
+                                     i, i, i, i, i, i, i);
+                    }
                     for (const auto& field : FrameCsvDetails) {
                         std::fprintf(file, ",%s", field.name);
                     }
                     std::fputs(",gpu_profile_enabled,tuning_hot_page_faults,tuning_parallel_protect,"
                                "tuning_late_protect,tuning_gpu_threads_priority,"
-                               "tuning_readback_window_bytes,tuning_gpu_profile,phase,ab_block,ab_state\n",
+                               "tuning_readback_window_bytes,tuning_gpu_profile,phase,ab_block,ab_state,ab_stage\n",
                                file);
                 }
             }
@@ -824,6 +880,12 @@ inline void CaptureFrameCsv(float draws_per_frame, float dispatches_per_frame) {
                     std::snprintf(capture.phase, sizeof(capture.phase), "%s", "combat");
                 else if (length == 3 && std::strcmp(next, "end") == 0)
                     std::snprintf(capture.phase, sizeof(capture.phase), "%s", "end");
+                CsvPhaseCode().store(std::strcmp(capture.phase, "combat") == 0 ? 1u :
+                                         std::strcmp(capture.phase, "end") == 0 ? 2u : 0u,
+                                     std::memory_order_relaxed);
+                std::snprintf(capture.ab_stage, sizeof(capture.ab_stage), "%s",
+                              std::strcmp(capture.phase, "combat") == 0 ? "combat" :
+                              std::strcmp(capture.phase, "end") == 0 ? "post" : "pre");
             }
             std::fclose(phase_file);
         }
@@ -863,6 +925,51 @@ inline void CaptureFrameCsv(float draws_per_frame, float dispatches_per_frame) {
             }
         }
     }
+    struct RegionRow {
+        u64 key{};
+        std::array<u64, 7> values{};
+    };
+    std::array<RegionRow, 8> top_regions{};
+    if (RegionDiagEnabled() && capture.last != 0) {
+        for (size_t i = 0; i < ReadbackRegionSlots; ++i) {
+            const auto& region = ReadbackRegions()[i];
+            const u64 key = region.key.load(std::memory_order_acquire);
+            const std::array<u64, 7> current{
+                region.calls_read.load(std::memory_order_relaxed),
+                region.calls_write.load(std::memory_order_relaxed),
+                region.stall_read_ns.load(std::memory_order_relaxed),
+                region.stall_write_ns.load(std::memory_order_relaxed),
+                region.queue_ns.load(std::memory_order_relaxed),
+                region.sync_ns.load(std::memory_order_relaxed),
+                region.async_wait_ns.load(std::memory_order_relaxed)};
+            RegionRow row{key, {}};
+            for (size_t j = 0; j < current.size(); ++j) {
+                row.values[j] = current[j] - capture.previous_region_diag[i][j];
+                capture.previous_region_diag[i][j] = current[j];
+            }
+            row.values[2] += row.values[3];
+            if (key == 0 || row.values[2] == 0) continue;
+            for (size_t rank = 0; rank < top_regions.size(); ++rank) {
+                if (row.values[2] <= top_regions[rank].values[2]) continue;
+                for (size_t move = top_regions.size() - 1; move > rank; --move)
+                    top_regions[move] = top_regions[move - 1];
+                top_regions[rank] = row;
+                break;
+            }
+        }
+    } else if (RegionDiagEnabled()) {
+        for (size_t i = 0; i < ReadbackRegionSlots; ++i) {
+            const auto& region = ReadbackRegions()[i];
+            capture.previous_region_diag[i] = {
+                region.calls_read.load(std::memory_order_relaxed),
+                region.calls_write.load(std::memory_order_relaxed),
+                region.stall_read_ns.load(std::memory_order_relaxed),
+                region.stall_write_ns.load(std::memory_order_relaxed),
+                region.queue_ns.load(std::memory_order_relaxed),
+                region.sync_ns.load(std::memory_order_relaxed),
+                region.async_wait_ns.load(std::memory_order_relaxed)};
+        }
+    }
     if (capture.last != 0) {
         std::fprintf(capture.file, "%llu,%.6f,%.3f,%.1f,%.1f,%.6f,%.6f,%.6f,%.6f,%llu,%llu,%.6f,%.6f,%.6f,%.6f,%llu,%llu,%llu,%llu,%llu,%llu,%.6f,%.6f,%.6f,\"%s\"",
                      static_cast<unsigned long long>(++capture.index),
@@ -888,6 +995,14 @@ inline void CaptureFrameCsv(float draws_per_frame, float dispatches_per_frame) {
                      double(totals[16] - capture.previous[16]) / 1e6,
                      double(totals[17] - capture.previous[17]) / 1e6,
                      double(cp_other) / 1e6, readback_regions.c_str());
+        for (const auto& row : top_regions) {
+            std::fprintf(capture.file, ",%llu,%llu,%llu,%.6f,%.6f,%.6f,%.6f",
+                         static_cast<unsigned long long>(row.key ? (row.key - 1) << 20 : 0),
+                         static_cast<unsigned long long>(row.values[0]),
+                         static_cast<unsigned long long>(row.values[1]),
+                         double(row.values[2]) / 1e6, double(row.values[4]) / 1e6,
+                         double(row.values[5]) / 1e6, double(row.values[6]) / 1e6);
+        }
     }
     for (size_t i = 0; i < std::size(FrameCsvDetails); ++i) {
         const auto& field = FrameCsvDetails[i];
@@ -904,7 +1019,7 @@ inline void CaptureFrameCsv(float draws_per_frame, float dispatches_per_frame) {
     }
     if (capture.last != 0) {
         const auto& tuning = GetTuning();
-        std::fprintf(capture.file, ",%u,%u,%u,%u,%u,%llu,%u,%s,%llu,%u\n",
+        std::fprintf(capture.file, ",%u,%u,%u,%u,%u,%llu,%u,%s,%llu,%u,%s\n",
                      tuning.gpu_profile.load(std::memory_order_relaxed) != 0 ? 1u : 0u,
                      tuning.hot_page_faults.load(std::memory_order_relaxed),
                      tuning.parallel_protect.load(std::memory_order_relaxed) ? 1u : 0u,
@@ -914,7 +1029,7 @@ inline void CaptureFrameCsv(float draws_per_frame, float dispatches_per_frame) {
                          tuning.readback_window_bytes.load(std::memory_order_relaxed)),
                      tuning.gpu_profile.load(std::memory_order_relaxed), capture.phase,
                      static_cast<unsigned long long>(tuning.ab_block.load(std::memory_order_relaxed)),
-                     tuning.ab_state.load(std::memory_order_relaxed));
+                     tuning.ab_state.load(std::memory_order_relaxed), capture.ab_stage);
     }
     // Bounded live visibility without flushing for each frame.
     if (now - capture.last_flush >= 1'000'000'000ULL) {
