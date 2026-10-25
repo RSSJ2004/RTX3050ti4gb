@@ -135,6 +135,14 @@ thread_local Rasterizer::SplitThreadState Rasterizer::split_thread_state{};
 
 namespace {
 
+bool CpDiagEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("ISS_CP_DIAG");
+        return value && value[0] == '1';
+    }();
+    return enabled;
+}
+
 bool EarlyFeedbackEnabled() {
     static const bool enabled=[] {const char *p=std::getenv("ISS_FEEDBACK_EARLY_SUBMIT");return p&&p[0]=='1';}();
     return enabled;
@@ -990,6 +998,8 @@ void Rasterizer::FlushComputeQueue() {
 }
 
 bool Rasterizer::FilterDraw() {
+    Common::Perf::OptionalScopedTimer timer{CpDiagEnabled(), Common::Perf::CpValidation,
+                                            Common::Perf::CpValidationNs};
     const auto& regs = DrawRegs();
     if (regs.color_control.mode == AmdGpu::ColorControl::OperationMode::EliminateFastClear) {
         // Clears the render target if FCE is launched before any draws
@@ -1477,6 +1487,8 @@ std::size_t Rasterizer::Draw(bool is_indexed, u32 index_offset,
 #include "native_instanced_run_rasterizer.inl"
 
 void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline,bool is_indexed,u32 index_offset) {
+    Common::Perf::OptionalScopedTimer timer{CpDiagEnabled(), Common::Perf::CpDraws,
+                                            Common::Perf::CpDrawNs};
     if (NativeVisualCaptureEnabled()) native_visual_latch = {};
     std::optional<iss::diagnostics::Scope> worker_scope;
     if(OnDrawWorker())worker_scope.emplace(iss::diagnostics::Draw);
@@ -1705,6 +1717,8 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_indexed,
                                     VAddr arg_address, u32 offset, u32 stride, u32 max_count,
                                     VAddr count_address) {
+    Common::Perf::OptionalScopedTimer timer{CpDiagEnabled(), Common::Perf::CpDraws,
+                                            Common::Perf::CpDrawNs};
     // The next fast draw compares with a draw recorded by the full path.
     fast_draw.valid = false;
     // The vertex count is in GPU memory: only the frame cap of SkipUnreadyDraw applies.
@@ -3389,6 +3403,8 @@ static bool StageMemoCycles();
 bool Rasterizer::BindResources(const Pipeline* pipeline,
                                const Shader::PushData* captured_push_data,
                                bool skip_compute_hle) {
+    Common::Perf::OptionalScopedTimer timer{CpDiagEnabled(), Common::Perf::CpBindings,
+                                            Common::Perf::CpBindingNs};
     const iss::cp_path::Scope cp_path_scope{iss::cp_path::BindRes};
     iss::feedback_join::BeginBindings();
     ++bind_resources_seq;
@@ -6257,4 +6273,3 @@ void IssPassCostTick(u32 packet_class) {
 void IssEngineFrame() {
     Vulkan::g_iss_frame.fetch_add(1, std::memory_order_relaxed);
 }
-

@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <condition_variable>
 #include <deque>
+#include <cstdlib>
 #include <fstream>
 #include <optional>
 #include <thread>
@@ -2645,6 +2646,12 @@ const GraphicsPipeline* PipelineCache::TryReuseGraphicsState() {
 }
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
+    static const bool cp_diag = [] {
+        const char* value = std::getenv("ISS_CP_DIAG");
+        return value && value[0] == '1';
+    }();
+    Common::Perf::OptionalScopedTimer timer{cp_diag, Common::Perf::CpPipelines,
+                                            Common::Perf::CpPipelineNs};
     iss::diagnostics::Scope phase_scope(iss::diagnostics::GraphicsPipeline);
     draw_indirect_params = params;
     static const bool state_reuse = [] {

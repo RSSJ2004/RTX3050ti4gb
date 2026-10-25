@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 #include "common/logging/log.h"
 #include "common/types.h"
@@ -276,6 +277,18 @@ enum Counter : u32 {
     CrossWaitsCompute,
     CrossQueueFlushes,
     CrossQueueFirstTouches,
+    // Optional command-processor attribution (ISS_CP_DIAG=1). These are timing scopes, not
+    // behavioral changes; nested categories may overlap and are reported independently.
+    CpDraws,
+    CpDrawNs,
+    CpValidation,
+    CpValidationNs,
+    CpBindings,
+    CpBindingNs,
+    CpPipelines,
+    CpPipelineNs,
+    CpPageTracking,
+    CpPageTrackingNs,
     CounterCount,
 };
 
@@ -641,6 +654,27 @@ private:
     u64 start;
 };
 
+class OptionalScopedTimer {
+public:
+    OptionalScopedTimer(bool enabled_, Counter count_counter_, Counter ns_counter_)
+        : enabled{enabled_}, count_counter{count_counter_}, ns_counter{ns_counter_},
+          start{enabled_ ? NowNs() : 0} {}
+    ~OptionalScopedTimer() {
+        if (enabled) {
+            Add(count_counter);
+            Add(ns_counter, NowNs() - start);
+        }
+    }
+    OptionalScopedTimer(const OptionalScopedTimer&) = delete;
+    OptionalScopedTimer& operator=(const OptionalScopedTimer&) = delete;
+
+private:
+    bool enabled;
+    Counter count_counter;
+    Counter ns_counter;
+    u64 start;
+};
+
 /// Frames slower than this (below 20 fps) are reported individually.
 constexpr double SlowFrameMs = 50.0;
 constexpr u32 MaxSlowFramesPerSecond = 10;
@@ -687,6 +721,11 @@ inline constexpr FrameCsvField FrameCsvDetails[] = {
     {"gpu_completed_work_ms", GpuProfileBusyNs, true},
     {"gpu_completed_submissions", GpuProfileSessions, false},
     {"gpu_completed_readback_ms", GpuProfileReadbackNs, true},
+    {"cp_draw_ms", CpDrawNs, true},
+    {"cp_validation_ms", CpValidationNs, true},
+    {"cp_binding_ms", CpBindingNs, true},
+    {"cp_pipeline_ms", CpPipelineNs, true},
+    {"cp_page_tracking_ms", CpPageTrackingNs, true},
 };
 
 inline void CaptureFrameCsv(float draws_per_frame, float dispatches_per_frame) {
@@ -697,7 +736,11 @@ inline void CaptureFrameCsv(float draws_per_frame, float dispatches_per_frame) {
         std::array<u64, 18> previous{};
         std::array<u64, std::size(FrameCsvDetails)> detail_previous{};
         u64 last_flush{};
+        u64 last_phase_poll{};
+        char phase[16]{"unknown"};
+        const char* phase_path{};
         Capture() {
+            phase_path = std::getenv("ISS_PHASE_FILE");
             if (const char* path = std::getenv("SHADPS4_FRAME_CSV"); path && *path) {
                 file = std::fopen(path, "wb");
                 if (file) {
@@ -710,7 +753,7 @@ inline void CaptureFrameCsv(float draws_per_frame, float dispatches_per_frame) {
                     }
                     std::fputs(",gpu_profile_enabled,tuning_hot_page_faults,tuning_parallel_protect,"
                                "tuning_late_protect,tuning_gpu_threads_priority,"
-                               "tuning_readback_window_bytes,tuning_gpu_profile\n",
+                               "tuning_readback_window_bytes,tuning_gpu_profile,phase\n",
                                file);
                 }
             }
@@ -724,6 +767,19 @@ inline void CaptureFrameCsv(float draws_per_frame, float dispatches_per_frame) {
     if (!capture.file)
         return;
     const u64 now = NowNs();
+    if (capture.phase_path && now - capture.last_phase_poll >= 250'000'000ULL) {
+        if (std::FILE* phase_file = std::fopen(capture.phase_path, "rb")) {
+            char next[sizeof(capture.phase)]{};
+            if (std::fgets(next, sizeof(next), phase_file)) {
+                const size_t length = std::strcspn(next, "\r\n");
+                next[length] = '\0';
+                if (length != 0)
+                    std::snprintf(capture.phase, sizeof(capture.phase), "%s", next);
+            }
+            std::fclose(phase_file);
+        }
+        capture.last_phase_poll = now;
+    }
     const std::array<u64, 18> totals{Total(ShaderCompileNs), Total(PipelineStallNs),
                                     Total(GpuWaitNs), Total(ReadbackStallNs), Total(ImageCreates),
                                     Total(PipelineSkips), Total(BufferUploadNs), Total(ImageRefreshNs),
@@ -770,7 +826,7 @@ inline void CaptureFrameCsv(float draws_per_frame, float dispatches_per_frame) {
     }
     if (capture.last != 0) {
         const auto& tuning = GetTuning();
-        std::fprintf(capture.file, ",%u,%u,%u,%u,%u,%llu,%u\n",
+        std::fprintf(capture.file, ",%u,%u,%u,%u,%u,%llu,%u,%s\n",
                      tuning.gpu_profile.load(std::memory_order_relaxed) != 0 ? 1u : 0u,
                      tuning.hot_page_faults.load(std::memory_order_relaxed),
                      tuning.parallel_protect.load(std::memory_order_relaxed) ? 1u : 0u,
@@ -778,7 +834,7 @@ inline void CaptureFrameCsv(float draws_per_frame, float dispatches_per_frame) {
                      tuning.gpu_threads_priority.load(std::memory_order_relaxed),
                      static_cast<unsigned long long>(
                          tuning.readback_window_bytes.load(std::memory_order_relaxed)),
-                     tuning.gpu_profile.load(std::memory_order_relaxed));
+                     tuning.gpu_profile.load(std::memory_order_relaxed), capture.phase);
     }
     // Bounded live visibility without flushing for each frame.
     if (now - capture.last_flush >= 1'000'000'000ULL) {

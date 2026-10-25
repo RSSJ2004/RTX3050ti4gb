@@ -3581,6 +3581,12 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
 
 bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size,
                                     bool is_written, bool is_texel_buffer) {
+    static const bool cp_diag = [] {
+        const char* value = std::getenv("ISS_CP_DIAG");
+        return value && value[0] == '1';
+    }();
+    Common::Perf::OptionalScopedTimer timer{cp_diag, Common::Perf::CpPageTracking,
+                                            Common::Perf::CpPageTrackingNs};
     auto& deferred_pages = ComputeScratchActive() ? compute_scratch.deferred_pages
                                                   : this->deferred_pages;
     iss::diagnostics::Scope phase_scope(iss::diagnostics::SyncMemory);
