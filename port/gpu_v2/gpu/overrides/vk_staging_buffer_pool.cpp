@@ -23,8 +23,8 @@ using VideoCore::MemoryType;
 
 namespace {
 
-constexpr u64 RING_IDLE_FRAMES = 300;
-constexpr u64 LARGE_IDLE_FRAMES = 120;
+constexpr u64 RING_IDLE_FRAMES = 120;
+constexpr u64 LARGE_IDLE_FRAMES = 60;
 constexpr u64 LARGE_MIN_GRANULARITY = 64_KB;
 constexpr u64 BLOCK_SIZE = 16_MB;
 
@@ -53,7 +53,7 @@ static bool StagingClasses() {
 static u64 LargeKeepBytes() {
     static const u64 bytes = [] {
         const char* value = std::getenv("ISS_STAGING_LARGE_KEEP_MB");
-        return (value ? u64(std::strtoull(value, nullptr, 10)) : u64(2048)) << 20;
+        return (value ? u64(std::strtoull(value, nullptr, 10)) : u64(256)) << 20;
     }();
     return bytes;
 }
@@ -79,11 +79,11 @@ static void NoteLargeAlloc() {
 static size_t RingKeepBlocks() {
     static const size_t keep = [] {
         const char* value = std::getenv("ISS_STAGING_RING_KEEP");
-        return value ? size_t(std::strtoul(value, nullptr, 10)) : size_t(8);
+        return value ? size_t(std::strtoul(value, nullptr, 10)) : size_t(2);
     }();
     return keep;
 }
-constexpr u64 RING_KEEP_IDLE_FRAMES = 4500;
+constexpr u64 RING_KEEP_IDLE_FRAMES = 120;
 
 } // Anonymous namespace
 

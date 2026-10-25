@@ -13,6 +13,9 @@
 
 namespace iss::vram_stats {
 
+constexpr std::uint64_t HardLimitBytes = 2000ull << 20;
+constexpr std::uint64_t PressureLimitBytes = 2200ull << 20;
+
 /// Buffer memory types (VideoCore::MemoryType order), then images.
 enum Kind : int { DeviceLocal, HostUncached, HostCached, Stream, Sparse, Images, KindCount };
 constexpr const char* KindNames[KindCount] = {"device_local", "upload", "readback",
@@ -55,6 +58,18 @@ inline void Untrack(VmaAllocation allocation) {
 
 inline std::uint64_t Bytes(int kind) {
     return State().bytes[kind].load(std::memory_order_relaxed);
+}
+
+inline std::uint64_t DeviceLocalBytes() {
+    return Bytes(DeviceLocal) + Bytes(Stream) + Bytes(Images);
+}
+
+inline bool UnderHardLimit() {
+    return DeviceLocalBytes() <= HardLimitBytes;
+}
+
+inline bool UnderPressureLimit() {
+    return DeviceLocalBytes() <= PressureLimitBytes;
 }
 
 } // namespace iss::vram_stats

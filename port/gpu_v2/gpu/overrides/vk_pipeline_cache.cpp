@@ -567,6 +567,11 @@ public:
         return done_cv.wait_for(lk, timeout, [pipeline] { return pipeline->IsReady(); });
     }
 
+    bool HasCapacity() {
+        std::scoped_lock lk{mutex};
+        return pending <= workers.size();
+    }
+
     /// A queued pipeline whose draw was just skipped goes to the front (ISS_ASYNC_SKIP_DRAWS):
     /// what is on screen appears first.
     void Prioritize(const Pipeline* pipeline) {
@@ -2384,14 +2389,31 @@ void PipelineCache::CompileAsync(Pipeline* pipeline) {
         LazyPipelines() ? 0
                         : Common::Perf::GetTuning().async_pipeline_wait_us.load(std::memory_order_relaxed);
     if (wait_us != 0) {
-        compiler->WaitFor(pipeline, std::chrono::microseconds{wait_us});
+        const auto wait_started = std::chrono::steady_clock::now();
+        const bool ready = compiler->WaitFor(pipeline, std::chrono::microseconds{wait_us});
+        if (std::getenv("ISS_PIPELINE_DIAG")) {
+            const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                        std::chrono::steady_clock::now() - wait_started)
+                                        .count();
+            LOG_WARNING(Render_Vulkan,
+                        "PIPE_DIAG async_wait wait_us={} elapsed_us={} ready={}", wait_us,
+                        elapsed_us, ready);
+        }
     }
 }
 
 void PipelineCache::QueuePreload(Pipeline* pipeline) { compiler->Submit(pipeline); }
 void PipelineCache::PrioritizeCompile(const Pipeline* pipeline) { compiler->Prioritize(pipeline); }
 bool PipelineCache::CompileNowIfQueued(const Pipeline* pipeline) {
-    return compiler->RunIfQueued(pipeline);
+    const auto started = std::chrono::steady_clock::now();
+    const bool compiled = compiler->RunIfQueued(pipeline);
+    if (compiled && std::getenv("ISS_PIPELINE_DIAG")) {
+        const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                    std::chrono::steady_clock::now() - started)
+                                    .count();
+        LOG_WARNING(Render_Vulkan, "PIPE_DIAG lazy_steal elapsed_us={}", elapsed_us);
+    }
+    return compiled;
 }
 void PipelineCache::WaitPreload() { compiler->WaitIdle(); }
 
@@ -2689,6 +2711,14 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         }();
         const bool defer =
             lazy || Common::Perf::GetTuning().async_pipelines.load(std::memory_order_relaxed) >= 1;
+        const auto compile_started = std::chrono::steady_clock::now();
+        if (!defer && std::getenv("ISS_PIPELINE_DIAG")) {
+            LOG_WARNING(Render_Vulkan,
+                        "PIPE_DIAG sync_compile pipeline={:#x} is_indirect={} compiler_capacity={}",
+                        pipeline_hash,
+                        bool(params.vertex_sgpr_offset || params.instance_sgpr_offset),
+                        compiler && compiler->HasCapacity());
+        }
         GraphicsPipeline::SerializationSupport sdata{};
         it.value() = std::make_unique<GraphicsPipeline>(
             instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
@@ -2718,6 +2748,13 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         }
         Common::Perf::Add(Common::Perf::PipelineStallNs, Common::Perf::NowNs() - start_ns);
         iss::pipeline_library::LogMiss("graphics", pipeline_hash, 0, Common::Perf::NowNs() - start_ns);
+        if (!defer && std::getenv("ISS_PIPELINE_DIAG")) {
+            const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                        std::chrono::steady_clock::now() - compile_started)
+                                        .count();
+            LOG_WARNING(Render_Vulkan, "PIPE_DIAG sync_compile_done pipeline={:#x} elapsed_us={}",
+                        pipeline_hash, elapsed_us);
+        }
         return remember(pipeline);
     }
     return remember(it->second.get());

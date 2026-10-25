@@ -187,7 +187,13 @@ void TextureCache::RefreshGcLimits() {
         device_guard_memory = std::max<u64>(card > headroom ? card - headroom : 0,
                                             card / 2);
     }
-    u64 budget = forced_gc_budget ? std::min(forced_gc_budget, card) : 0;
+    // RTX 3050 Ti profile: keep the image cache below 2 GiB and start the global guard at
+    // 2.2 GiB. The latter includes buffers, staging and driver allocations; the former is the
+    // hard texture-cache ceiling that the LRU collector must enforce.
+    device_guard_memory = std::min(device_guard_memory, iss::vram_stats::PressureLimitBytes);
+    u64 budget = forced_gc_budget
+                     ? std::min({forced_gc_budget, card, iss::vram_stats::HardLimitBytes})
+                     : 0;
     // ISS_GC_BUDGET_MB=auto: the textures get what the device guard leaves after everything else
     // (arena, staging, swapchain, the driver), measured now: any card, other programs' VRAM and
     // the arena growing in new areas included. 512 MB at least.
@@ -196,7 +202,7 @@ void TextureCache::RefreshGcLimits() {
         const u64 others = usage > image_bytes ? usage - image_bytes : 0;
         auto_budget_memory =
             std::max<u64>(device_guard_memory > others ? device_guard_memory - others : 0, 512ull << 20);
-        budget = auto_budget_memory;
+        budget = std::min(auto_budget_memory, iss::vram_stats::HardLimitBytes);
     }
     if (budget == 0 && instance.IsIntegrated()) {
         budget = card;
@@ -1701,6 +1707,12 @@ void TextureCache::GarbageCollectImages() {
             } else if (device + (512ull << 20) >= device_guard_memory) {
                 total_used_memory = std::max(total_used_memory, pressure_gc_memory);
             }
+        }
+        // VMA sees allocations that the driver's image counter does not classify as cache
+        // images. Treat the tracked 2 GiB ceiling as critical pressure so the existing LRU pass
+        // also recycles textures when buffers/staging are the part consuming the budget.
+        if (!iss::vram_stats::UnderHardLimit()) {
+            total_used_memory = std::max(total_used_memory, critical_gc_memory);
         }
     }
     if (total_used_memory < trigger_gc_memory) {

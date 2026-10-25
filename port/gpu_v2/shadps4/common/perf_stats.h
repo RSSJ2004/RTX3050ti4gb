@@ -362,7 +362,7 @@ struct Tuning {
     /// not ready yet are skipped. 2: same for compute pipelines and dispatches.
     std::atomic<u32> async_pipelines{2};
     /// How long the command processor waits for a new pipeline before skipping its work.
-    std::atomic<u32> async_pipeline_wait_us{3000};
+    std::atomic<u32> async_pipeline_wait_us{1000};
     /// Complete compute work using a fast first pipeline, optimize a replacement in the background.
     std::atomic<bool> tiered_compute_pipelines{false};
     /// Records a GPU checkpoint before each draw and dispatch, reported with the device fault

@@ -427,7 +427,11 @@ extern "C" int iss_gpu_initialize(const IssGpuCallbacks *callbacks){
         Common::FS::SetUserPath(Common::FS::PathType::CacheDir, path);
         std::fprintf(stderr, "PORT_TUNING pipeline_cache_root=%s\n", path.string().c_str());
     }
-    Common::Perf::GetTuning().async_pipelines=0; // Never skip a draw while compiling its pipeline.
+    const bool async_pipelines = [] {
+        const char* p = std::getenv("ISS_ASYNC_PIPELINES");
+        return !p || p[0] != '0';
+    }();
+    Common::Perf::GetTuning().async_pipelines = async_pipelines ? 1 : 0;
     const bool render_reuse=[] {const char *p=std::getenv("ISS_RENDER_REUSE");return p&&p[0]=='1';}();
     auto& tuning=Common::Perf::GetTuning();
     if(const char *p=std::getenv("ISS_PROBE_HOST_IMPORT");p&&p[0]=='1')tuning.probe_host_import=1;
@@ -459,7 +463,9 @@ extern "C" int iss_gpu_initialize(const IssGpuCallbacks *callbacks){
     std::fprintf(stderr,"PORT_TUNING render_reuse=%d real_occlusion=%d\n",render_reuse,occlusion);
     const bool upload_worker=[] {const char *p=std::getenv("ISS_UPLOAD_WORKER");return p&&p[0]=='1';}();
     Common::Perf::GetTuning().async_uploads=upload_worker;
-    std::fprintf(stderr,"PORT_TUNING async_uploads=%d async_pipelines=0\n",upload_worker);
+    std::fprintf(stderr,"PORT_TUNING async_uploads=%d async_pipelines=%d wait_us=%u\n",
+                 upload_worker, async_pipelines,
+                 tuning.async_pipeline_wait_us.load(std::memory_order_relaxed));
     if(const char *p=std::getenv("ISS_GPU_PROFILE");p&&(p[0]=='1'||p[0]=='2'))Common::Perf::GetTuning().gpu_profile=p[0]-'0';
     {const char *p=std::getenv("ISS_COMPUTE_PHASES");iss::phase::g_enabled=p&&p[0]=='1';
      std::fprintf(stderr,"PORT_TUNING compute_phases=%d\n",iss::phase::Enabled()?1:0);}
