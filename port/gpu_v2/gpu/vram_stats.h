@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <mutex>
 #include <unordered_map>
+#include "common/perf_stats.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 #include <vk_mem_alloc.h>
 
@@ -31,6 +32,8 @@ inline Table& State() {
     return t;
 }
 
+inline std::uint64_t DeviceLocalBytes();
+
 /// Counts `allocation` under `kind` when it landed in device local memory.
 inline void Track(VmaAllocator allocator, VmaAllocation allocation, int kind) {
     if (!allocation) return;
@@ -43,6 +46,7 @@ inline void Track(VmaAllocator allocator, VmaAllocation allocation, int kind) {
     std::scoped_lock lock{t.mutex};
     t.allocations[allocation] = {kind, info.size};
     t.bytes[kind].fetch_add(info.size, std::memory_order_relaxed);
+    Common::Perf::SetVramBytesSnapshot(DeviceLocalBytes());
 }
 
 /// Before the allocation is destroyed.
@@ -54,6 +58,7 @@ inline void Untrack(VmaAllocation allocation) {
     if (it == t.allocations.end()) return;
     t.bytes[it->second.first].fetch_sub(it->second.second, std::memory_order_relaxed);
     t.allocations.erase(it);
+    Common::Perf::SetVramBytesSnapshot(DeviceLocalBytes());
 }
 
 inline std::uint64_t Bytes(int kind) {

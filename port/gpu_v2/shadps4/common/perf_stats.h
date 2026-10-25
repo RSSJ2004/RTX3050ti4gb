@@ -298,6 +298,22 @@ struct CounterRegistry {
     std::atomic<bool> overflow{false};
 };
 
+/// Renderer-owned device-local allocation snapshot for frame CSV consumers. It is deliberately
+/// separate from the per-thread counters because VMA allocation and destruction happen on several
+/// renderer threads. A value of zero means that the renderer has not published a snapshot yet.
+inline std::atomic<u64>& VramBytesSnapshot() {
+    static std::atomic<u64> bytes{};
+    return bytes;
+}
+
+inline void SetVramBytesSnapshot(u64 bytes) noexcept {
+    VramBytesSnapshot().store(bytes, std::memory_order_relaxed);
+}
+
+inline u64 GetVramBytesSnapshot() noexcept {
+    return VramBytesSnapshot().load(std::memory_order_relaxed);
+}
+
 inline CounterRegistry& Registry() {
     static CounterRegistry registry{};
     return registry;
@@ -686,7 +702,7 @@ inline void CaptureFrameCsv(float draws_per_frame, float dispatches_per_frame) {
                 file = std::fopen(path, "wb");
                 if (file) {
                     std::setvbuf(file, nullptr, _IOFBF, 256 * 1024);
-                    std::fputs("frame,present_ms,draws,dispatches,shader_compile_ms,pipeline_stall_"
+                    std::fputs("frame,present_ms,vram_mb,draws,dispatches,shader_compile_ms,pipeline_stall_"
                                "ms,gpu_wait_ms,readback_stall_ms,new_images,pipeline_skips,buffer_upload_ms,image_refresh_ms,page_protect_ms,pipeline_compile_ms,shader_compiles,pipelines_created,buffer_upload_bytes,image_upload_bytes,fault_reads,fault_writes,command_processor_ms,command_spin_ms",
                                file);
                     for (const auto& field : FrameCsvDetails) {
@@ -712,9 +728,11 @@ inline void CaptureFrameCsv(float draws_per_frame, float dispatches_per_frame) {
                                     Total(PipelineCreates), Total(BufferUploadBytes), Total(ImageUploadBytes),
                                     Total(FaultReads), Total(FaultWrites), Total(GpuBusyNs), Total(GpuSpinNs)};
     if (capture.last != 0) {
-        std::fprintf(capture.file, "%llu,%.6f,%.1f,%.1f,%.6f,%.6f,%.6f,%.6f,%llu,%llu,%.6f,%.6f,%.6f,%.6f,%llu,%llu,%llu,%llu,%llu,%llu,%.6f,%.6f",
+        std::fprintf(capture.file, "%llu,%.6f,%.3f,%.1f,%.1f,%.6f,%.6f,%.6f,%.6f,%llu,%llu,%.6f,%.6f,%.6f,%.6f,%llu,%llu,%llu,%llu,%llu,%llu,%.6f,%.6f",
                      static_cast<unsigned long long>(++capture.index),
-                     double(now - capture.last) / 1e6, draws_per_frame, dispatches_per_frame,
+                     double(now - capture.last) / 1e6,
+                     double(GetVramBytesSnapshot()) / (1024.0 * 1024.0), draws_per_frame,
+                     dispatches_per_frame,
                      double(totals[0] - capture.previous[0]) / 1e6,
                      double(totals[1] - capture.previous[1]) / 1e6,
                      double(totals[2] - capture.previous[2]) / 1e6,
