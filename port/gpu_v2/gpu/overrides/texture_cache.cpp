@@ -1642,13 +1642,18 @@ void TextureCache::UntrackImageTail(ImageId image_id) {
 
 void TextureCache::GarbageCollectImages() {
     static std::atomic<u64> spared{}, deleted{};
-    if (gc_tick % 600 == 0)
+    static const bool pipeline_diag = [] {
+        const char* value = std::getenv("ISS_PIPELINE_DIAG");
+        return value && value[0] == '1';
+    }();
+    const bool report = gc_tick % 600 == 0 || (pipeline_diag && gc_tick % 60 == 0);
+    if (report)
         std::fprintf(stderr, "TEXTURE_GC spared=%llu deleted=%llu streak_images=%llu used=%llu MB trigger=%llu MB\n",
                      (unsigned long long)spared.load(), (unsigned long long)deleted.load(),
                      (unsigned long long)tex_streak_images.load(),
                      (unsigned long long)(total_used_memory >> 20),
                      (unsigned long long)(trigger_gc_memory >> 20));
-    if (gc_tick % 600 == 0 && instance.CanReportMemoryUsage()) {
+    if (report && instance.CanReportMemoryUsage()) {
         // Where the VRAM goes: the collector only frees images; the arena (guest memory the
         // GPU used, resident for good) and the rest (staging, pipelines, swapchain) stay.
         const u64 usage = instance.GetDeviceMemoryUsage();
@@ -1692,6 +1697,7 @@ void TextureCache::GarbageCollectImages() {
                              (unsigned long long)((h[i].highest - h[i].lowest) >> 20),
                              (unsigned long long)h[i].allocs, (unsigned long long)h[i].frees);
         }
+        std::fflush(stderr);
     }
     if (instance.CanReportMemoryUsage()) {
         const u64 device = instance.GetDeviceMemoryUsage();
