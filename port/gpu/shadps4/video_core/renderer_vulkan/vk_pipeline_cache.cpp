@@ -1109,6 +1109,24 @@ const GraphicsPipeline* PipelineCache::TryPreparedPipeline(const PreparedDraw& p
 namespace {
 enum class Bp07Reason : u32 { Skippable, Small, Indirect, LightFrame, NoStreak, Count };
 
+const char* Bp07ReasonName(Bp07Reason reason) {
+    switch (reason) {
+    case Bp07Reason::Skippable:
+        return "skippable";
+    case Bp07Reason::Small:
+        return "small";
+    case Bp07Reason::Indirect:
+        return "indirect";
+    case Bp07Reason::LightFrame:
+        return "light-frame";
+    case Bp07Reason::NoStreak:
+        return "no-streak";
+    case Bp07Reason::Count:
+        return "count";
+    }
+    return "unknown";
+}
+
 struct Bp07State {
     struct TargetStreak {
         u64 last_frame = ~0ull;
@@ -1194,15 +1212,14 @@ void Bp07Tally(bool compiled_now) {
         return;
     }
     st.last_log = now;
-    static constexpr const char* names[] = {"skippable", "small", "indirect", "light-frame",
-                                            "no-streak"};
     std::string line;
     for (size_t r = 0; r < size_t(Bp07Reason::Count); ++r) {
         if (st.sync[r] == 0 && st.skipped[r] == 0) {
             continue;
         }
         line += fmt::format(" {}: {} compiled now, {} went without (last target {:#x}, {} indices);",
-                            names[r], st.sync[r], st.skipped[r], st.last_target_of[r],
+                            Bp07ReasonName(static_cast<Bp07Reason>(r)), st.sync[r], st.skipped[r],
+                            st.last_target_of[r],
                             st.last_indices_of[r]);
     }
     if (!line.empty()) {
@@ -1410,6 +1427,10 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         return nullptr;
     }
 compile_now:
+    const auto compile_now_started = std::chrono::steady_clock::now();
+    LOG_WARNING(Render_Vulkan,
+                "PIPE_DIAG compile_now sync_compile={} is_indirect={} compiler_capacity={}",
+                sel.sync_compile, params.is_indirect, compiler && compiler->HasCapacity());
     const auto [it, is_new] = graphics_pipelines.try_emplace(sel.graphics_key);
     if (is_new) {
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(sel.graphics_key);
@@ -1443,6 +1464,10 @@ compile_now:
         }
         sel.fetch_shader.reset();
     }
+    const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::steady_clock::now() - compile_now_started)
+                                .count();
+    LOG_WARNING(Render_Vulkan, "PIPE_DIAG compile_now elapsed_us={}", elapsed_us);
     return it->second.get();
 }
 
