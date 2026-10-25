@@ -1508,6 +1508,7 @@ void BufferCache::BeginRelaxedReadback(VAddr device_addr, u64 size) {
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool assume_locks,
                              u64 guest_rip) {
     AssertGraphicsReadbackOwner();
+    Common::Perf::RecordReadbackRegion(device_addr);
     if (cp_split_enabled && liverpool && liverpool->CpSplitActive())
         ASSERT_MSG(liverpool->AscOwnerPausedForGraphics(),
                    "G4 readback entered without an acknowledged C owner pause");

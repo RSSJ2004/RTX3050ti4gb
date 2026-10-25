@@ -335,23 +335,91 @@ void ApplyTuningFile(const std::filesystem::path& path, Common::Perf::Tuning& tu
     std::fprintf(stderr, "TUNING_RELOAD path=%s\n", path.string().c_str());
     LogTuningEffective(tuning, "perf_tuning.ini");
 }
+
+struct AbSchedule {
+    std::string name;
+    u64 first{};
+    u64 second{};
+    u64 block_seconds{};
+};
+
+bool ParseAbSchedule(const char* text, AbSchedule& out) {
+    if (!text || !*text) return false;
+    std::vector<std::string> parts;
+    std::string value{text};
+    size_t start = 0;
+    while (start <= value.size()) {
+        const size_t end = value.find(':', start);
+        parts.push_back(value.substr(start, end == std::string::npos ? end : end - start));
+        if (end == std::string::npos) break;
+        start = end + 1;
+    }
+    if (parts.size() != 4 || parts[0].empty() || parts[3].empty()) return false;
+    out.name = parts[0];
+    out.first = std::strtoull(parts[1].c_str(), nullptr, 0);
+    out.second = std::strtoull(parts[2].c_str(), nullptr, 0);
+    out.block_seconds = std::strtoull(parts[3].c_str(), nullptr, 0);
+    return out.block_seconds != 0 &&
+           (out.name == "hot_page_faults" || out.name == "parallel_protect" ||
+            out.name == "late_protect" || out.name == "gpu_threads_priority" ||
+            out.name == "gpu_profile" || out.name == "readback_window_bytes" ||
+            out.name == "readback_window_kb");
+}
+
+void ApplyAbSchedule(const AbSchedule& schedule, Common::Perf::Tuning& tuning, u64 block) {
+    const u64 value = (block & 1) ? schedule.second : schedule.first;
+    if (schedule.name == "hot_page_faults") {
+        tuning.hot_page_faults.store(static_cast<u32>(value), std::memory_order_relaxed);
+    } else if (schedule.name == "parallel_protect") {
+        tuning.parallel_protect.store(value != 0, std::memory_order_relaxed);
+    } else if (schedule.name == "late_protect") {
+        tuning.late_protect.store(value != 0, std::memory_order_relaxed);
+    } else if (schedule.name == "gpu_threads_priority") {
+        tuning.gpu_threads_priority.store(static_cast<u32>(value), std::memory_order_relaxed);
+    } else if (schedule.name == "gpu_profile") {
+        tuning.gpu_profile.store(static_cast<u32>(value), std::memory_order_relaxed);
+    } else if (schedule.name == "readback_window_kb") {
+        tuning.readback_window_bytes.store(value * 1024, std::memory_order_relaxed);
+    } else if (schedule.name == "readback_window_bytes") {
+        tuning.readback_window_bytes.store(value, std::memory_order_relaxed);
+    }
+    tuning.ab_block.store(block, std::memory_order_relaxed);
+    tuning.ab_state.store(static_cast<u32>(block & 1), std::memory_order_relaxed);
+}
 } // namespace
 
 void StartTuningWatcher() {
     const char* enabled = std::getenv("ISS_TUNING_WATCH");
-    if (!enabled || enabled[0] != '1' || tuning_watcher.joinable()) return;
+    const char* schedule_text = std::getenv("ISS_AB_SCHEDULE");
+    if ((!enabled || enabled[0] != '1') && (!schedule_text || !*schedule_text)) return;
+    if (tuning_watcher.joinable()) return;
     const auto path = std::filesystem::path(host.user_dir) / "perf_tuning.ini";
-    tuning_watcher = std::jthread([path](std::stop_token stop) {
+    AbSchedule schedule{};
+    const bool schedule_enabled = ParseAbSchedule(schedule_text, schedule);
+    tuning_watcher = std::jthread([path, schedule, schedule_enabled, watch = enabled && enabled[0] == '1'](std::stop_token stop) {
         std::filesystem::file_time_type previous{};
         bool seen = false;
+        u64 applied_block = ~u64{};
+        const auto started = std::chrono::steady_clock::now();
         auto& tuning = Common::Perf::GetTuning();
         while (!stop.stop_requested()) {
-            std::error_code error;
-            const auto stamp = std::filesystem::last_write_time(path, error);
-            if (!error && (!seen || stamp != previous)) {
-                previous = stamp;
-                seen = true;
-                ApplyTuningFile(path, tuning);
+            if (watch) {
+                std::error_code error;
+                const auto stamp = std::filesystem::last_write_time(path, error);
+                if (!error && (!seen || stamp != previous)) {
+                    previous = stamp;
+                    seen = true;
+                    ApplyTuningFile(path, tuning);
+                }
+            }
+            if (schedule_enabled) {
+                const u64 elapsed = static_cast<u64>(std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::steady_clock::now() - started).count());
+                const u64 block = elapsed / schedule.block_seconds;
+                if (block != applied_block) {
+                    ApplyAbSchedule(schedule, tuning, block);
+                    applied_block = block;
+                }
             }
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
@@ -604,6 +672,15 @@ extern "C" int iss_gpu_initialize(const IssGpuCallbacks *callbacks){
             else if(name=="relaxed_all")tuning.relaxed_all=std::strtoull(value.c_str(),nullptr,0)!=0;
             else known=false;
             std::fprintf(stderr,"PORT_TUNING %s=%s%s\n",name.c_str(),value.c_str(),known?"":" (unknown, ignored)");
+        }
+    }
+    // Keep the dedicated diagnostic switch effective even when ISS_TUNING also contains a
+    // gpu_profile entry; an empty variable preserves the existing behavior.
+    if (const char* p = std::getenv("ISS_GPU_PROFILE"); p && *p) {
+        char* end = nullptr;
+        const unsigned long value = std::strtoul(p, &end, 0);
+        if (end != p && *end == '\0' && (value == 1 || value == 2)) {
+            tuning.gpu_profile.store(static_cast<u32>(value), std::memory_order_relaxed);
         }
     }
     Core::PerfSampler::StartTuningWatcher();

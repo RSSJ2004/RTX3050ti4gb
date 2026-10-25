@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 
 #include "common/logging/log.h"
 #include "common/types.h"
@@ -327,6 +328,37 @@ inline u64 GetVramBytesSnapshot() noexcept {
     return VramBytesSnapshot().load(std::memory_order_relaxed);
 }
 
+constexpr size_t ReadbackRegionSlots = 64;
+struct ReadbackRegionCounter {
+    std::atomic<u64> key{};
+    std::atomic<u64> reads{};
+};
+
+inline std::array<ReadbackRegionCounter, ReadbackRegionSlots>& ReadbackRegions() {
+    static std::array<ReadbackRegionCounter, ReadbackRegionSlots> regions{};
+    return regions;
+}
+
+/// Records one readback in its 1 MiB address region; reporting is deferred to CaptureFrameCsv.
+inline void RecordReadbackRegion(u64 address) noexcept {
+    const u64 key = (address >> 20) + 1;
+    auto& regions = ReadbackRegions();
+    const size_t slot = static_cast<size_t>((key * 0x9E3779B97F4A7C15ULL) >> 58);
+    for (size_t probe = 0; probe < ReadbackRegionSlots; ++probe) {
+        auto& region = regions[(slot + probe) & (ReadbackRegionSlots - 1)];
+        u64 current = region.key.load(std::memory_order_acquire);
+        if (current == key) {
+            region.reads.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        if (current == 0 && region.key.compare_exchange_strong(
+                current, key, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            region.reads.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+    }
+}
+
 inline CounterRegistry& Registry() {
     static CounterRegistry registry{};
     return registry;
@@ -563,6 +595,9 @@ struct Tuning {
     /// time, submissions in flight, those carrying readbacks), 2 also around each compute
     /// dispatch (GPU time per compute shader, top shaders logged every 5 s).
     std::atomic<u32> gpu_profile{0};
+    /// Current optional ISS_AB_SCHEDULE block and selected state, reported in the frame CSV.
+    std::atomic<u64> ab_block{0};
+    std::atomic<u32> ab_state{0};
     /// readback_relaxed_sites: code of the game (offsets of 256 byte blocks of its executable, as
     /// the readback site report shows them) whose reads of GPU written memory do not wait for
     /// the GPU. The read gets guest memory as it is (data of the previous download, a frame or
@@ -625,6 +660,14 @@ inline u64 NowNs() {
     return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                 std::chrono::steady_clock::now().time_since_epoch())
                                 .count());
+}
+
+inline bool CommandProcessorDiagnosticsEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("ISS_CP_DIAG");
+        return value && value[0] == '1';
+    }();
+    return enabled;
 }
 
 inline u32 CurrentCpu() {
@@ -735,9 +778,11 @@ inline void CaptureFrameCsv(float draws_per_frame, float dispatches_per_frame) {
         u64 index{};
         std::array<u64, 18> previous{};
         std::array<u64, std::size(FrameCsvDetails)> detail_previous{};
+        std::array<u64, 5> previous_cp{};
+        std::array<u64, ReadbackRegionSlots> previous_regions{};
         u64 last_flush{};
         u64 last_phase_poll{};
-        char phase[16]{"unknown"};
+        char phase[16]{"wait"};
         const char* phase_path{};
         Capture() {
             phase_path = std::getenv("ISS_PHASE_FILE");
@@ -746,14 +791,14 @@ inline void CaptureFrameCsv(float draws_per_frame, float dispatches_per_frame) {
                 if (file) {
                     std::setvbuf(file, nullptr, _IOFBF, 256 * 1024);
                     std::fputs("frame,present_ms,vram_mb,draws,dispatches,shader_compile_ms,pipeline_stall_"
-                               "ms,gpu_wait_ms,readback_stall_ms,new_images,pipeline_skips,buffer_upload_ms,image_refresh_ms,page_protect_ms,pipeline_compile_ms,shader_compiles,pipelines_created,buffer_upload_bytes,image_upload_bytes,fault_reads,fault_writes,command_processor_ms,command_spin_ms",
+                               "ms,gpu_wait_ms,readback_stall_ms,new_images,pipeline_skips,buffer_upload_ms,image_refresh_ms,page_protect_ms,pipeline_compile_ms,shader_compiles,pipelines_created,buffer_upload_bytes,image_upload_bytes,fault_reads,fault_writes,command_processor_ms,command_spin_ms,cp_other_ms,readback_region_reads",
                                file);
                     for (const auto& field : FrameCsvDetails) {
                         std::fprintf(file, ",%s", field.name);
                     }
                     std::fputs(",gpu_profile_enabled,tuning_hot_page_faults,tuning_parallel_protect,"
                                "tuning_late_protect,tuning_gpu_threads_priority,"
-                               "tuning_readback_window_bytes,tuning_gpu_profile,phase\n",
+                               "tuning_readback_window_bytes,tuning_gpu_profile,phase,ab_block,ab_state\n",
                                file);
                 }
             }
@@ -773,8 +818,12 @@ inline void CaptureFrameCsv(float draws_per_frame, float dispatches_per_frame) {
             if (std::fgets(next, sizeof(next), phase_file)) {
                 const size_t length = std::strcspn(next, "\r\n");
                 next[length] = '\0';
-                if (length != 0)
-                    std::snprintf(capture.phase, sizeof(capture.phase), "%s", next);
+                if (length == 4 && std::strcmp(next, "wait") == 0)
+                    std::snprintf(capture.phase, sizeof(capture.phase), "%s", "wait");
+                else if (length == 6 && std::strcmp(next, "combat") == 0)
+                    std::snprintf(capture.phase, sizeof(capture.phase), "%s", "combat");
+                else if (length == 3 && std::strcmp(next, "end") == 0)
+                    std::snprintf(capture.phase, sizeof(capture.phase), "%s", "end");
             }
             std::fclose(phase_file);
         }
@@ -786,8 +835,36 @@ inline void CaptureFrameCsv(float draws_per_frame, float dispatches_per_frame) {
                                     Total(ProtectNs), Total(PipelineCreateNs), Total(ShaderCompiles),
                                     Total(PipelineCreates), Total(BufferUploadBytes), Total(ImageUploadBytes),
                                     Total(FaultReads), Total(FaultWrites), Total(GpuBusyNs), Total(GpuSpinNs)};
+    u64 cp_other = 0;
+    if (CommandProcessorDiagnosticsEnabled()) {
+        const std::array<u64, 5> cp_totals{Total(CpDrawNs), Total(CpValidationNs), Total(CpBindingNs),
+                                           Total(CpPipelineNs), Total(CpPageTrackingNs)};
+        const u64 cp_busy = totals[16] - capture.previous[16];
+        u64 cp_attributed = 0;
+        for (size_t i = 0; i < cp_totals.size(); ++i) {
+            cp_attributed += cp_totals[i] - capture.previous_cp[i];
+            capture.previous_cp[i] = cp_totals[i];
+        }
+        cp_other = cp_busy > cp_attributed ? cp_busy - cp_attributed : 0;
+    }
+    std::string readback_regions;
     if (capture.last != 0) {
-        std::fprintf(capture.file, "%llu,%.6f,%.3f,%.1f,%.1f,%.6f,%.6f,%.6f,%.6f,%llu,%llu,%.6f,%.6f,%.6f,%.6f,%llu,%llu,%llu,%llu,%llu,%llu,%.6f,%.6f",
+        for (size_t i = 0; i < ReadbackRegionSlots; ++i) {
+            const auto& region = ReadbackRegions()[i];
+            const u64 key = region.key.load(std::memory_order_acquire);
+            const u64 reads = region.reads.load(std::memory_order_relaxed);
+            const u64 delta = reads - capture.previous_regions[i];
+            capture.previous_regions[i] = reads;
+            if (key != 0 && delta != 0) {
+                if (!readback_regions.empty()) readback_regions += '|';
+                readback_regions += std::to_string((key - 1) << 20);
+                readback_regions += ':';
+                readback_regions += std::to_string(delta);
+            }
+        }
+    }
+    if (capture.last != 0) {
+        std::fprintf(capture.file, "%llu,%.6f,%.3f,%.1f,%.1f,%.6f,%.6f,%.6f,%.6f,%llu,%llu,%.6f,%.6f,%.6f,%.6f,%llu,%llu,%llu,%llu,%llu,%llu,%.6f,%.6f,%.6f,\"%s\"",
                      static_cast<unsigned long long>(++capture.index),
                      double(now - capture.last) / 1e6,
                      double(GetVramBytesSnapshot()) / (1024.0 * 1024.0), draws_per_frame,
@@ -809,7 +886,8 @@ inline void CaptureFrameCsv(float draws_per_frame, float dispatches_per_frame) {
                      static_cast<unsigned long long>(totals[14] - capture.previous[14]),
                      static_cast<unsigned long long>(totals[15] - capture.previous[15]),
                      double(totals[16] - capture.previous[16]) / 1e6,
-                     double(totals[17] - capture.previous[17]) / 1e6);
+                     double(totals[17] - capture.previous[17]) / 1e6,
+                     double(cp_other) / 1e6, readback_regions.c_str());
     }
     for (size_t i = 0; i < std::size(FrameCsvDetails); ++i) {
         const auto& field = FrameCsvDetails[i];
@@ -826,7 +904,7 @@ inline void CaptureFrameCsv(float draws_per_frame, float dispatches_per_frame) {
     }
     if (capture.last != 0) {
         const auto& tuning = GetTuning();
-        std::fprintf(capture.file, ",%u,%u,%u,%u,%u,%llu,%u,%s\n",
+        std::fprintf(capture.file, ",%u,%u,%u,%u,%u,%llu,%u,%s,%llu,%u\n",
                      tuning.gpu_profile.load(std::memory_order_relaxed) != 0 ? 1u : 0u,
                      tuning.hot_page_faults.load(std::memory_order_relaxed),
                      tuning.parallel_protect.load(std::memory_order_relaxed) ? 1u : 0u,
@@ -834,7 +912,9 @@ inline void CaptureFrameCsv(float draws_per_frame, float dispatches_per_frame) {
                      tuning.gpu_threads_priority.load(std::memory_order_relaxed),
                      static_cast<unsigned long long>(
                          tuning.readback_window_bytes.load(std::memory_order_relaxed)),
-                     tuning.gpu_profile.load(std::memory_order_relaxed), capture.phase);
+                     tuning.gpu_profile.load(std::memory_order_relaxed), capture.phase,
+                     static_cast<unsigned long long>(tuning.ab_block.load(std::memory_order_relaxed)),
+                     tuning.ab_state.load(std::memory_order_relaxed));
     }
     // Bounded live visibility without flushing for each frame.
     if (now - capture.last_flush >= 1'000'000'000ULL) {
