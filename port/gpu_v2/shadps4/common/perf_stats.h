@@ -829,6 +829,7 @@ inline void CaptureFrameCsv(float draws_per_frame, float dispatches_per_frame) {
         std::array<u64, 18> previous{};
         std::array<u64, std::size(FrameCsvDetails)> detail_previous{};
         std::array<u64, 5> previous_cp{};
+        std::array<u64, 5> previous_merge{};
         std::array<u64, ReadbackRegionSlots> previous_regions{};
         std::array<std::array<u64, 7>, ReadbackRegionSlots> previous_region_diag{};
         u64 last_flush{};
@@ -854,7 +855,10 @@ inline void CaptureFrameCsv(float draws_per_frame, float dispatches_per_frame) {
                     }
                     std::fputs(",gpu_profile_enabled,tuning_hot_page_faults,tuning_parallel_protect,"
                                "tuning_late_protect,tuning_gpu_threads_priority,"
-                               "tuning_readback_window_bytes,tuning_gpu_profile,phase,ab_block,ab_state,ab_stage\n",
+                               "tuning_readback_window_bytes,tuning_gpu_profile,"
+                               "tuning_readback_write_discard,tuning_readback_write_merge,"
+                               "merge_snapshots_delta,merge_snapshots_skipped_delta,merge_pages_delta,"
+                               "merge_kept_bytes_delta,merge_guest_bytes_delta,phase,ab_block,ab_state,ab_stage\n",
                                file);
                 }
             }
@@ -897,6 +901,12 @@ inline void CaptureFrameCsv(float draws_per_frame, float dispatches_per_frame) {
                                     Total(ProtectNs), Total(PipelineCreateNs), Total(ShaderCompiles),
                                     Total(PipelineCreates), Total(BufferUploadBytes), Total(ImageUploadBytes),
                                     Total(FaultReads), Total(FaultWrites), Total(GpuBusyNs), Total(GpuSpinNs)};
+    const std::array<u64, 5> merge_totals{
+        Total(MergeSnapshots), Total(MergeSnapshotsSkipped), Total(MergePages),
+        Total(MergeKeptBytes), Total(MergeGuestBytes)};
+    std::array<u64, 5> merge_deltas{};
+    for (size_t i = 0; i < merge_totals.size(); ++i)
+        merge_deltas[i] = merge_totals[i] - capture.previous_merge[i];
     u64 cp_other = 0;
     if (CommandProcessorDiagnosticsEnabled()) {
         const std::array<u64, 5> cp_totals{Total(CpDrawNs), Total(CpValidationNs), Total(CpBindingNs),
@@ -1019,7 +1029,7 @@ inline void CaptureFrameCsv(float draws_per_frame, float dispatches_per_frame) {
     }
     if (capture.last != 0) {
         const auto& tuning = GetTuning();
-        std::fprintf(capture.file, ",%u,%u,%u,%u,%u,%llu,%u,%s,%llu,%u,%s\n",
+        std::fprintf(capture.file, ",%u,%u,%u,%u,%u,%llu,%u,%u,%u,%llu,%llu,%llu,%llu,%llu,%s,%llu,%u,%s\n",
                      tuning.gpu_profile.load(std::memory_order_relaxed) != 0 ? 1u : 0u,
                      tuning.hot_page_faults.load(std::memory_order_relaxed),
                      tuning.parallel_protect.load(std::memory_order_relaxed) ? 1u : 0u,
@@ -1027,7 +1037,14 @@ inline void CaptureFrameCsv(float draws_per_frame, float dispatches_per_frame) {
                      tuning.gpu_threads_priority.load(std::memory_order_relaxed),
                      static_cast<unsigned long long>(
                          tuning.readback_window_bytes.load(std::memory_order_relaxed)),
-                     tuning.gpu_profile.load(std::memory_order_relaxed), capture.phase,
+                     tuning.gpu_profile.load(std::memory_order_relaxed),
+                     tuning.readback_write_discard.load(std::memory_order_relaxed) ? 1u : 0u,
+                     tuning.readback_write_merge.load(std::memory_order_relaxed) ? 1u : 0u,
+                     static_cast<unsigned long long>(merge_deltas[0]),
+                     static_cast<unsigned long long>(merge_deltas[1]),
+                     static_cast<unsigned long long>(merge_deltas[2]),
+                     static_cast<unsigned long long>(merge_deltas[3]),
+                     static_cast<unsigned long long>(merge_deltas[4]), capture.phase,
                      static_cast<unsigned long long>(tuning.ab_block.load(std::memory_order_relaxed)),
                      tuning.ab_state.load(std::memory_order_relaxed), capture.ab_stage);
     }
@@ -1038,6 +1055,7 @@ inline void CaptureFrameCsv(float draws_per_frame, float dispatches_per_frame) {
     }
     capture.last = now;
     capture.previous = totals;
+    capture.previous_merge = merge_totals;
 }
 
 inline void OnFlip(float draws_per_frame, float dispatches_per_frame) {
