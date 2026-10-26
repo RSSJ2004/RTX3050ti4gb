@@ -47,13 +47,13 @@ static bool StagingClasses() {
     return enabled;
 }
 [[maybe_unused]] constexpr u64 LARGE_KEEP_FRAMES = 3600;
-// ISS_STAGING_LARGE_KEEP_MB (default 2048): idle large buffers kept per memory type. At 1 GB the
+// ISS_STAGING_LARGE_KEEP_MB (default 128): idle large buffers kept per memory type. At 1 GB the
 // city went over it (1062 MB), trimmed 8 buffers and allocated again: 32 dedicated allocations,
 // 150 ms of the command processor in a 140 s run (cpprof3 2026-10-18).
 static u64 LargeKeepBytes() {
     static const u64 bytes = [] {
         const char* value = std::getenv("ISS_STAGING_LARGE_KEEP_MB");
-        return (value ? u64(std::strtoull(value, nullptr, 10)) : u64(256)) << 20;
+        return (value ? u64(std::strtoull(value, nullptr, 10)) : u64(128)) << 20;
     }();
     return bytes;
 }
